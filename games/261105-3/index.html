@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+<title>ころん、ばったり！パン屋と点灯夫の影時計</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#1a2252;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+  overscroll-behavior:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;outline:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(()=>{
+'use strict';
+/* ================= 基本 ================= */
+const TAU=Math.PI*2, PI=Math.PI;
+const rnd=Math.random, ri=n=>Math.floor(rnd()*n);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v, lerp=(a,b,t)=>a+(b-a)*t;
+const ease=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const COL={navy:'#1a2252',ver:'#d9472b',amb:'#f2a93b',ult:'#2f56c6'};
+const LUM={navy:1,ult:2,ver:3,amb:4};
+// 時間帯ごとの [空, 地面]
+const PAL=[['ver','ult'],['amb','ver'],['amb','ult'],['ult','amb'],['ult','ver'],
+           ['ver','amb'],['navy','ver'],['navy','amb'],['navy','ult'],['ult','navy']];
+const N=10;                 // 輪のマス
+const T_DAWN=0,T_OVEN=1,T_DUSK=5,T_LAMP=6,T_PROJ=7;
+const isNight=t=>t>=6;
+const LX=[470,690,960];     // 街灯
+const MEETX=575;
+const STREET=45;            // 人が立つ通り
+const LOG=[]; function log(k,v){LOG.push({k,v,t:Math.round(performance.now())});if(LOG.length>500)LOG.shift();}
+
+/* ================= 状態と保存 ================= */
+const KEY='gf261105-3-town';
+function shuffle(a){for(let i=a.length-1;i>0;i--){const j=ri(i+1);[a[i],a[j]]=[a[j],a[i]];}return a;}
+function defState(){return{v:1,sun:0,ex:0,swaps:0,swapped:false,shelf:[],orn:[-1,-1,-1],lit:[false,false,false],
+  carry:false,bLight:false,shapes:shuffle([0,1,2,3,4,5]),si:0,tonight:ri(3),baked:false,plaza:[],res:false,
+  swapAt:-1,first:true,miss:0,proj:false,turns:0,lap:0,exLap:0};}
+const isInt=(v,a,b)=>Number.isInteger(v)&&v>=a&&v<=b;
+const isBool=v=>typeof v==='boolean';
+function validate(o){
+  try{
+    if(!o||typeof o!=='object'||o.v!==1)return null;
+    if(!isInt(o.sun,0,N-1)||!isInt(o.ex,0,1e6)||!isInt(o.swaps,0,1e6)||!isBool(o.swapped))return null;
+    if(o.swaps!==Math.floor(o.ex/3)||o.swapped!==(o.swaps%2===1))return null;
+    const arr=(a,n0,n1,f)=>Array.isArray(a)&&a.length>=n0&&a.length<=n1&&a.every(f);
+    if(!arr(o.shelf,0,8,v=>isInt(v,0,5)))return null;
+    if(!arr(o.orn,3,3,v=>isInt(v,-1,5)))return null;
+    if(!arr(o.lit,3,3,isBool))return null;
+    if(!arr(o.shapes,6,6,v=>isInt(v,0,5))||new Set(o.shapes).size!==6)return null;
+    if(!arr(o.plaza,0,12,v=>isInt(v,0,5)))return null;
+    if(!isInt(o.si,0,5)||!isInt(o.tonight,0,2)||!isInt(o.swapAt,-1,N-1)||!isInt(o.miss,0,99)||!isInt(o.turns,0,1e9)||!isInt(o.lap,0,1e9)||!isInt(o.exLap,0,1e9)||o.exLap>o.lap)return null;
+    for(const b of['carry','bLight','baked','res','first','proj'])if(!isBool(o[b]))return null;
+    if(o.res!==(o.swaps>0))return null;
+    const s=defState();
+    for(const k in s)s[k]=Array.isArray(o[k])?o[k].slice():o[k];
+    return s;
+  }catch(e){return null;}
+}
+let storageOK=true;
+function load(){
+  try{const raw=localStorage.getItem(KEY);if(!raw)return defState();
+    const v=validate(JSON.parse(raw));if(!v){log('save-bad');return defState();}log('save-restored');return v;
+  }catch(e){storageOK=false;log('save-denied');return defState();}
+}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(S));}catch(e){storageOK=false;log('save-fail');}}
+let S=load();
+
+/* ================= 画面配置 ================= */
+let W=0,H=0,dpr=1,k=1,ox=0,y0=0,cx=0,rx=0,ry=0,tileR=20,D=120,dX=0,dY=0,HALO=4;
+const P={x:500,y:250,rx:300,ry:150}; // 広場（世界座標）
+const safe={t:0,r:0,b:0,l:0};
+function readSafe(){const cs=getComputedStyle(document.getElementById('sa'));
+  safe.t=parseFloat(cs.paddingTop)||0;safe.r=parseFloat(cs.paddingRight)||0;
+  safe.b=parseFloat(cs.paddingBottom)||0;safe.l=parseFloat(cs.paddingLeft)||0;}
+function layout(){
+  readSafe();
+  W=Math.max(1,window.innerWidth);H=Math.max(1,window.innerHeight);
+  dpr=Math.min(2,window.devicePixelRatio||1);
+  cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);
+  const L0=safe.l,R0=W-safe.r,T0=safe.t,B0=H-safe.b;
+  const land=W>H*1.05;
+  tileR=clamp(Math.min(W,H)*0.034,13,26);
+  cx=(L0+R0)/2;const cy=(T0+B0)/2;y0=cy;
+  rx=(R0-L0)/2-tileR-6;ry=(B0-T0)/2-tileR-6;
+  k=Math.min((R0-L0)*(land?0.70:0.86)/1000,ry*0.80/320);
+  ox=cx-500*k;
+  D=clamp(Math.min(W,H)*0.25,90,150);
+  dX=cx;
+  const front=y0+95*k, bot=y0+ry*0.86;
+  dY=Math.max(front+D*0.75,(front+bot)/2+D*0.08);
+  P.x=(dX-ox)/k;P.y=(dY-y0)/k;
+  P.rx=Math.min(rx*0.62,D*1.9)/k;P.ry=Math.max(D*0.92,Math.min((bot-front)*0.5,D*1.1))/k;
+  HALO=5/k;
+  for(const d of dancers){if(d.tx!==undefined){}}
+  if(S.res)setFormation(true);
+}
+
+/* ================= 音 ================= */
+let AC=null,master=null,NB=null;
+function initAudio(){
+  try{
+    if(AC){if(AC.state==='suspended')AC.resume().catch(()=>{});return;}
+    const A=window.AudioContext||window.webkitAudioContext;if(!A)return;
+    AC=new A();master=AC.createGain();master.gain.value=0.5;
+    const comp=AC.createDynamicsCompressor();master.connect(comp);comp.connect(AC.destination);
+    NB=AC.createBuffer(1,Math.floor(AC.sampleRate*0.3),AC.sampleRate);
+    const d=NB.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+    const s=AC.createBufferSource();s.buffer=AC.createBuffer(1,1,22050);s.connect(AC.destination);s.start(0);
+    if(AC.state==='suspended')AC.resume().catch(()=>{});
+    log('audio',AC.state);
+  }catch(e){AC=null;}
+}
+function A_(fn){if(!AC||AC.state==='closed')return;try{fn(AC.currentTime+0.005);}catch(e){}}
+function env(g,t,a,d,v){g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(0.0002,v),t+a);g.gain.exponentialRampToValueAtTime(0.0001,t+a+d);}
+function osc(type,f0,f1,t,dur,v){const o=AC.createOscillator(),g=AC.createGain();o.type=type;o.frequency.setValueAtTime(f0,t);
+  if(f1)o.frequency.exponentialRampToValueAtTime(f1,t+dur);env(g,t,0.004,dur,v);o.connect(g);g.connect(master);o.start(t);o.stop(t+dur+0.05);}
+function noise(t,dur,v,f){const s=AC.createBufferSource();s.buffer=NB;const b=AC.createBiquadFilter();b.type='bandpass';b.frequency.value=f;b.Q.value=1.4;
+  const g=AC.createGain();env(g,t,0.002,dur,v);s.connect(b);b.connect(g);g.connect(master);s.start(t);s.stop(t+dur+0.05);}
+const sfx={
+  wood(p=1,v=0.45){A_(t=>{osc('triangle',640*p,380*p,t,0.12,v);osc('sine',1500*p,1100*p,t,0.035,v*0.35);noise(t,0.03,v*0.6,2300*p);});},
+  press(){A_(t=>{osc('sine',180,120,t,0.08,0.35);noise(t,0.04,0.25,700);});},
+  roll(){A_(t=>{for(let i=0;i<4;i++){const q=t+i*0.09;osc('triangle',520+i*40,380,q,0.05,0.18);noise(q,0.02,0.25,2600);}});},
+  hop(i){const sc=[1,1.12,1.26,1.5,1.33,1.19,0.89,0.84,0.75,0.8];this.wood(sc[i%N],0.5);},
+  pop(){A_(t=>{osc('sine',280,760,t,0.12,0.4);noise(t,0.04,0.2,1500);});},
+  fire(){A_(t=>{noise(t,0.35,0.12,500);});},
+  lamp(){A_(t=>{osc('sine',990,980,t,0.6,0.22);osc('triangle',1480,1470,t+0.03,0.4,0.1);noise(t,0.03,0.2,3000);});},
+  success(){A_(t=>{const n=[784,988,1175,1568];n.forEach((f,i)=>{osc('triangle',f,f,t+i*0.085,0.28,0.26);osc('sine',f*2,f*2,t+i*0.085,0.18,0.07);});});},
+  swap(){A_(t=>{const n=[523,659,784,1047,784,1047,1319];n.forEach((f,i)=>{osc('square',f,f,t+i*0.09,0.14,0.07);osc('triangle',f,f,t+i*0.09,0.3,0.2);});});},
+  tip(){A_(t=>{osc('sine',660,880,t,0.07,0.2);});},
+  tick(){A_(t=>{osc('triangle',900,700,t,0.04,0.09);});},
+  step(){A_(t=>{osc('triangle',420+ri(4)*60,300,t,0.05,0.16);noise(t,0.02,0.15,1800);});},
+  hum(){A_(t=>{osc('sine',196,196,t,0.9,0.14);osc('sine',294,294,t+0.08,0.8,0.1);osc('triangle',392,392,t+0.16,0.6,0.08);});},
+};
+
+/* ================= コルーチン ================= */
+const tasks=[];
+function spawn(g){const t={g,wait:0,until:null,done:false};tasks.push(t);adv(t);return t;}
+function adv(t){
+  for(let guard=0;guard<200;guard++){
+    if(t.done||t.wait>0)return;
+    if(t.until){if(!t.until())return;t.until=null;}
+    const r=t.g.next();
+    if(r.done){t.done=true;return;}
+    const v=r.value;
+    if(typeof v==='number')t.wait=v;
+    else if(typeof v==='function')t.until=v;
+  }
+}
+function updTasks(dt){for(let i=0;i<tasks.length;i++){const t=tasks[i];if(t.wait>0){t.wait-=dt;if(t.wait>0)continue;t.wait=0;}adv(t);}
+  for(let i=tasks.length-1;i>=0;i--)if(tasks[i].done)tasks.splice(i,1);}
+
+/* ================= 人物 ================= */
+function mkP(kind){return{kind,x:0,y:STREET,tx:0,face:1,faceLock:0,phase:0,moving:false,climb:0,climbT:0,
+  hatLift:0,hatT:0,arm:'idle',hx:0,hy:0,hold:null,hatHide:false,toolHide:false,toolHand:false,busy:false,wob:0,speed:kind==='small'?400:330,
+  hwx:0,hwy:0,hop:0};}
+const small=mkP('small'), tall=mkP('tall');
+const B=()=>S.swapped?tall:small;     // パンを焼く役
+const Lr=()=>S.swapped?small:tall;    // 灯りをともす役
+const hatOf=p=>((p.kind==='small')!==S.swapped)?'toque':'top';
+const toolOf=p=>((p.kind==='small')!==S.swapped)?'peel':'ladder';
+const home=p=>p===B()?250:830;
+small.x=small.tx=home(small);tall.x=tall.tx=home(tall);
+function* walkTo(p,x){p.tx=x;yield()=>Math.abs(p.x-p.tx)<2;}
+function* tipBoth(a,b){a.hatT=b.hatT=0.7;sfx.tip();yield 0.7;}
+
+/* ---- 住人（仕事交換の後に現れる） ---- */
+const dancers=[];
+const WINDOWS=[[525,-132,30,36],[600,-132,30,36],[750,-180,28,34],[800,-180,28,34],[862,-180,28,34],[772,-246,22,26],[868,-102,30,34],[560,-62,30,30]];
+let headsIn=[]; // 窓に顔を出している窓番号
+function mkDancer(i){return{type:i%7,x:0,y:0,tx:0,ty:0,face:1,phase:rnd()*6,hop:0,jump:null,stomp:0,scale:[0.72,0.58,0.76,0.62,0.82,0.64,0.7][i%7]};}
+
+/* ================= 動くもの ================= */
+const flyers=[], parts=[], projs=[];
+function fly(o){const f=Object.assign({t:0,dur:0.5,arc:80,s0:12,s1:12,rot:0,spin:0,done:false},o);flyers.push(f);return f;}
+function crumbs(x,y,n){for(let i=0;i<n&&parts.length<60;i++)parts.push({x,y,vx:(rnd()-.5)*160,vy:-rnd()*160-40,life:0.6+rnd()*0.3,s:3+rnd()*4,kind:0,fl:Math.max(y+8,STREET+10)});}
+function smoke(x,y){for(let i=0;i<3&&parts.length<60;i++)parts.push({x:x+(rnd()-.5)*10,y,vx:(rnd()-.5)*12,vy:-40-rnd()*20,life:1.2+i*0.25,s:7+i*3,kind:1,d:i*0.25});}
+
+/* ================= 影 ================= */
+const sunSh={shx:0,shy:0.3,s:1}; const lampS=[0,0,0];
+function sunTarget(t){const a=PI+t*TAU/N;const hx=Math.cos(a),e=Math.max(0,-Math.sin(a));
+  const Lf=0.32+1.45*(1-e);return{shx:-hx*Lf*0.95,shy:Lf*0.42,Lf};}
+function shadowLen(){return sunTarget(S.sun).Lf;}
+function shears(x){const out=[];
+  if(sunSh.s>0.01)out.push([sunSh.shx*sunSh.s,sunSh.shy*sunSh.s]);
+  for(let i=0;i<3;i++)if(lampS[i]>0.01){const dx=x-LX[i];if(Math.abs(dx)<12||Math.abs(dx)>560)continue;
+    out.push([clamp(dx/115,-2.4,2.4)*lampS[i],0.62*lampS[i]]);}
+  return out;}
+
+/* ================= その他の演出状態 ================= */
+const dice={sy:1,vy:0,sx:1,hop:0,rot:0,rollT:0,sym:0,pressed:false,idleT:0,demo:0};
+let busy=false,queued=false,pressId=null,lastInput=performance.now(),hintDone=false,hint=null;
+const sunA={from:S.sun,t:1,dur:0.26,sq:0};
+let ovenGlow=0,slotHint=null,ladder={on:false,x:0},winFlash=0,signPop=0;
+const breadPop=new Array(8).fill(0);
+const wob={};const lampFlash=[0,0,0];
+let clock=0;
+const COLnow=()=>{const p=PAL[S.sun];const a=p[0],b=p[1];return{sky:COL[a],gr:COL[b],light:COL[LUM[a]>=LUM[b]?a:b],dark:COL[LUM[a]>=LUM[b]?b:a]};};
+let CC=COLnow();
+
+/* ================= 進行（ディレクター） ================= */
+function meaningful(t){
+  const ph=S.ex%3; // 0:夕焼けでパン 1:夜明けで灯り 2:夕焼けで仕事交換
+  if(t===T_DUSK){if(ph===0)return S.shelf.length>=(S.ex===0?2:1)&&S.lap>=S.exLap+(S.ex===0?1:0);if(ph===2)return S.lap>=S.exLap+1;return false;}
+  if(t===T_DAWN)return ph===1&&(S.carry||S.lit.some(v=>v));
+  return false;
+}
+function chooseRoll(){
+  if(S.first){S.first=false;return 1;}
+  let d=-1;for(let i=1;i<=3;i++){if(meaningful((S.sun+i)%N)){d=i;break;}}
+  let r=1+ri(3);
+  if(d>0){
+    const must=S.miss>=1;
+    if(must||rnd()<0.55){r=d;}
+    else if(r>d){S.miss++;}
+    else{r=Math.min(r,d);}
+    if(r===d)S.miss=0;
+  }
+  if(S.swaps===0||rnd()<0.5){ // 交換の前は空振りの出会いを避ける
+    const land=(S.sun+r)%N;
+    if((land===T_DAWN||land===T_DUSK)&&!meaningful(land)){
+      for(const alt of[1,2,3]){const l2=(S.sun+alt)%N;if(!((l2===T_DAWN||l2===T_DUSK)&&!meaningful(l2))){r=alt;break;}}
+    }
+  }
+  return r;
+}
+
+/* ================= ターン ================= */
+function startTurn(){if(busy)return;busy=true;spawn(turn());}
+function* turn(){
+  log('turn',S.sun);
+  dice.rollT=0.5;sfx.roll();
+  yield 0.42;
+  const r=chooseRoll();
+  log('roll',r);
+  for(let i=0;i<r;i++){
+    yield* hopSun();
+    yield* passTile(S.sun,i===r-1);
+  }
+  yield* landTile(S.sun);
+  S.turns++;save();
+  busy=false;
+  if(queued){queued=false;startTurn();}
+}
+function* hopSun(){
+  sunA.from=S.sun;sunA.t=0;
+  yield()=>sunA.t>=1;
+  S.sun=(S.sun+1)%N;sunA.from=S.sun;sunA.sq=1;
+  CC=COLnow();sfx.hop(S.sun);
+  if(S.res)setFormation(false);
+}
+function* passTile(t,last){
+  if(t===T_DAWN)yield* dawnArrive();
+  if(t===T_DUSK){S.baked=false;S.tonight=pickLamp();}
+  if(!S.baked&&(t===T_OVEN||(t===T_DAWN&&S.bLight)))yield* bakeJob(t===T_DAWN);
+  if(t===T_LAMP)yield* lampJob();
+  if(t===T_PROJ)yield* projJob();
+}
+function pickLamp(){const c=[0,1,2].filter(i=>i!==S.tonight);return c[ri(c.length)];}
+function* landTile(t){
+  if(t===T_DAWN||t===T_DUSK){yield* meeting(t);}
+  else if(S.res){yield* stompDance();}
+  else yield 0.05;
+}
+
+/* ---- 窯 ---- */
+function slotPos(i){const row=i<4?0:1,c=i%4;return{x:326+c*35,y:(row?-112:-60)-12};}
+function* bakeJob(early){
+  const b=B();b.busy=true;
+  yield* walkTo(b,165);
+  b.faceLock=-1;b.toolHand=true;b.arm='peel';
+  ovenGlow=1;sfx.fire();
+  yield b.kind==='tall'?0.18:0.28;
+  const shape=S.shapes[S.si];
+  if(S.shelf.length>=8){S.shelf.shift();const p=slotPos(0);crumbs(p.x,p.y,6);}
+  const idx=S.shelf.length,sp=slotPos(idx);
+  slotHint={idx,shape};
+  sfx.pop();
+  const tl=b.kind==='tall';
+  b.arm='fling';
+  const f=fly({kind:'bshadow',shape,x0:75,y0:-24,x1:sp.x,y1:sp.y,arc:tl?250:150,dur:tl?0.7:0.55,s0:10,s1:15,spin:tl?TAU:0});
+  yield()=>f.done;
+  S.shelf.push(shape);slotHint=null;breadPop[idx]=1;crumbs(sp.x,sp.y,5);sfx.wood(1.4,0.5);smoke(266,-262);
+  S.baked=true;log('bake',{shape,early,by:b.kind,n:S.shelf.length});
+  yield 0.12;
+  b.toolHand=false;b.arm='idle';b.faceLock=0;ovenGlow=0;b.busy=false;b.tx=home(b);
+}
+/* ---- 街灯 ---- */
+function* climbLamp(p,i,fn){
+  yield* walkTo(p,LX[i]-30);
+  p.faceLock=1;p.toolHide=true;ladder={on:true,x:LX[i]};sfx.wood(0.8,0.35);
+  const sm=p.kind==='small',steps=sm?4:1,ch=sm?132:24;
+  for(let s=1;s<=steps;s++){p.climbT=ch*s/steps;sfx.step();yield sm?0.13:0.16;}
+  p.arm='reach';yield 0.14;
+  yield* fn();
+  p.arm='idle';p.climbT=0;yield sm?0.2:0.14;
+  ladder.on=false;p.toolHide=false;p.faceLock=0;
+}
+function* lampJob(){
+  const L=Lr();L.busy=true;
+  const i=S.tonight;
+  if(!S.lit[i]){
+    yield* climbLamp(L,i,function*(){S.lit[i]=true;lampFlash[i]=1;sfx.lamp();log('lamp',{i,by:L.kind,orn:S.orn[i]});yield 0.3;});
+  }
+  L.busy=false;L.tx=home(L);
+}
+/* ---- 飾りの影を広場へ ---- */
+function projPos(i){const a=[PI*0.9,PI*0.3,PI*0.03][i],r=[0.7,0.62,0.86][i];return{x:P.x+Math.cos(a)*P.rx*r,y:P.y+Math.sin(a)*P.ry*0.7+P.ry*0.1};}
+function* projJob(){
+  const any=S.orn.some(v=>v>=0);if(!any)return;
+  let src=S.lit.findIndex(v=>v);
+  if(src<0)return;
+  // 灯りが飾りのある街灯へ跳び移る
+  for(let i=0;i<3;i++){if(S.orn[i]>=0&&!S.lit[i]){
+    const f=fly({kind:'flame',x0:LX[src],y0:-222,x1:LX[i],y1:-222,arc:70,dur:0.4});
+    yield()=>f.done;S.lit[i]=true;lampFlash[i]=1;sfx.lamp();src=i;}}
+  sfx.hum();
+  const shapes=[];
+  for(let i=0;i<3;i++)if(S.orn[i]>=0&&S.lit[i]){projs.push({i,shape:S.orn[i],t:0});shapes.push(S.orn[i]);}
+  yield 0.7;
+  for(const s of shapes){S.plaza.push(s);if(S.plaza.length>12)S.plaza.shift();}
+  S.proj=true;log('project',shapes);
+  if(S.res)yield* stompDance();
+}
+/* ---- 夜明け：街灯が消え、灯りがランタンへ ---- */
+function* dawnArrive(){
+  const L=Lr();const fs=[];
+  for(let i=0;i<3;i++)if(S.lit[i]){S.lit[i]=false;
+    fs.push(fly({kind:'flame',x0:LX[i],y0:-222,x1:L.hwx,y1:L.hwy,target:L,arc:60,dur:0.45}));}
+  if(fs.length){yield()=>fs.every(f=>f.done);S.carry=true;sfx.tip();log('collect',fs.length);}
+  S.proj=false;projs.length=0;S.lap++;
+}
+
+/* ---- 出会い ---- */
+function* meeting(t){
+  const b=B(),L=Lr();
+  const ph=S.ex%3;
+  if(ph===2&&t===T_DUSK){yield* swapScript(t);return;}
+  if(ph===0&&t===T_DUSK&&S.shelf.length>0){yield* breadExchange(b,L);return;}
+  if(ph===1&&t===T_DAWN&&S.carry){yield* lightExchange(b,L);return;}
+  // ただのあいさつ
+  b.busy=L.busy=true;
+  const a1=spawn(walkTo(b,MEETX-60)),a2=spawn(walkTo(L,MEETX+60));
+  yield()=>a1.done&&a2.done;
+  b.faceLock=1;L.faceLock=-1;yield* tipBoth(b,L);log('meet-greet',t);
+  b.faceLock=L.faceLock=0;b.busy=L.busy=false;b.tx=home(b);L.tx=home(L);
+  if(S.res)yield* stompDance();
+}
+function* breadExchange(b,L){
+  b.busy=L.busy=true;
+  const a2=spawn(walkTo(L,MEETX+40));
+  yield* walkTo(b,380);
+  b.faceLock=1;b.arm='reach';yield 0.15;
+  const shape=S.shelf.pop();breadPop[S.shelf.length]=0;
+  b.hold={k:'bread',shape};b.arm='carry';b.faceLock=0;sfx.wood(1.2,0.3);
+  yield* walkTo(b,MEETX-40);
+  yield()=>a2.done;
+  b.faceLock=1;L.faceLock=-1;
+  yield* tipBoth(b,L);
+  b.arm='give';L.arm='give';yield 0.12;
+  b.hold=null;
+  const f=fly({kind:'bread',shape,x0:b.hwx,y0:b.hwy,x1:L.hwx,y1:L.hwy,target:L,arc:45,dur:0.38});
+  yield()=>f.done;
+  L.hold={k:'bread',shape};L.arm='carry';
+  S.ex++;S.exLap=S.lap;sfx.success();log('ex-bread',{shape,ex:S.ex});crumbs(L.hwx,L.hwy,4);
+  b.arm='idle';b.faceLock=0;b.busy=false;b.tx=home(b);
+  yield 0.2;
+  L.faceLock=0;
+  const i=S.tonight;
+  yield* climbLamp(L,i,function*(){
+    L.hold=null;
+    const f2=fly({kind:'bread',shape,x0:L.hwx,y0:L.hwy,x1:LX[i]+27,y1:-170,arc:25,dur:0.25});
+    yield()=>f2.done;
+    S.orn[i]=shape;sfx.wood(1.6,0.4);log('ornament',{i,shape});
+    yield 0.25;
+  });
+  L.arm='idle';L.busy=false;L.tx=home(L);
+}
+function* lightExchange(b,L){
+  b.busy=L.busy=true;
+  const a1=spawn(walkTo(b,MEETX-40)),a2=spawn(walkTo(L,MEETX+40));
+  yield()=>a1.done&&a2.done;
+  b.faceLock=1;L.faceLock=-1;
+  yield* tipBoth(b,L);
+  b.arm='give';L.arm='give';yield 0.12;
+  S.carry=false;
+  const f=fly({kind:'flame',x0:L.hwx,y0:L.hwy,x1:b.hwx,y1:b.hwy,target:b,arc:45,dur:0.38});
+  yield()=>f.done;
+  b.hold={k:'flame'};b.arm='carry';
+  S.ex++;S.exLap=S.lap;sfx.success();log('ex-light',{ex:S.ex});
+  L.arm='idle';L.faceLock=0;L.busy=false;L.tx=home(L);
+  b.faceLock=0;
+  yield* walkTo(b,196);
+  b.faceLock=1;b.arm='reach';yield 0.15;
+  b.hold=null;
+  const f2=fly({kind:'flame',x0:b.hwx,y0:b.hwy,x1:195,y1:-121,arc:20,dur:0.25});
+  yield()=>f2.done;
+  S.bLight=true;winFlash=1;
+  S.si=(S.si+1)%6;signPop=1;sfx.lamp();log('bakery-light',{next:S.shapes[S.si]});
+  yield 0.3;
+  b.arm='idle';b.faceLock=0;b.busy=false;b.tx=home(b);
+}
+function* swapScript(t){
+  const b=B(),L=Lr();b.busy=L.busy=true;
+  const a1=spawn(walkTo(b,MEETX-45)),a2=spawn(walkTo(L,MEETX+45));
+  yield()=>a1.done&&a2.done;
+  b.faceLock=1;L.faceLock=-1;
+  yield* tipBoth(b,L);
+  // 帽子と道具が入れ替わる
+  const hs=small,ht=tall;
+  const hsY=hs.y-135-hs.climb,htY=ht.y-226-ht.climb;
+  hs.hatHide=ht.hatHide=true;hs.toolHide=ht.toolHide=true;
+  const f1=fly({kind:'hat',hat:hatOf(hs),x0:hs.x,y0:hsY,x1:ht.x,y1:htY,arc:110,dur:0.6,spin:TAU});
+  const f2=fly({kind:'hat',hat:hatOf(ht),x0:ht.x,y0:htY,x1:hs.x,y1:hsY,arc:150,dur:0.6,spin:-TAU});
+  const f3=fly({kind:'tool',tool:toolOf(hs),x0:hs.x-10,y0:hs.y-80,x1:ht.x-10,y1:ht.y-120,arc:60,dur:0.55,spin:PI});
+  const f4=fly({kind:'tool',tool:toolOf(ht),x0:ht.x-10,y0:ht.y-120,x1:hs.x-10,y1:hs.y-80,arc:90,dur:0.55,spin:-PI});
+  yield()=>f1.done&&f2.done&&f3.done&&f4.done;
+  S.swapped=!S.swapped;S.ex++;S.swaps++;S.swapAt=t;S.exLap=S.lap;
+  hs.hatHide=ht.hatHide=false;hs.toolHide=ht.toolHide=false;
+  sfx.swap();log('swap',{at:t,swaps:S.swaps,swapped:S.swapped});
+  yield* tipBoth(hs,ht);
+  // 仕事場へ
+  const nb=B(),nl=Lr();nb.faceLock=nl.faceLock=0;
+  const w1=spawn((function*(){yield* climbLamp(nl,S.tonight,function*(){sfx.tick();yield 0.4;});nl.busy=false;nl.tx=home(nl);})());
+  const w2=spawn((function*(){yield* walkTo(nb,165);nb.faceLock=-1;nb.toolHand=true;nb.arm='peel';ovenGlow=0.6;yield 0.5;
+    nb.toolHand=false;nb.arm='idle';nb.faceLock=0;ovenGlow=0;nb.busy=false;nb.tx=home(nb);})());
+  // 窓辺の住人
+  if(!S.res){
+    headsIn=[0,1,2,3,4,6];sfx.tick();yield 0.5;
+    S.res=true;makeDancers(true);log('residents',dancers.length);
+  }else{makeDancers(false);}
+  yield()=>w1.done&&w2.done;
+  setFormation(false);
+  yield* stompDance();
+}
+
+/* ---- 影踏み ---- */
+const FORMS=['ring','cross','line'];
+let curForm='';
+function dancerCount(){return Math.min(7,4+S.orn.filter(v=>v>=0).length+(S.swaps>1?1:0));}
+function makeDancers(fromWin){
+  const n=dancerCount();
+  while(dancers.length<n){const d=mkDancer(dancers.length);
+    const w=WINDOWS[dancers.length%WINDOWS.length];
+    d.x=w[0]+w[2]/2;d.y=w[1]+w[3];
+    if(!fromWin){d.x=P.x+(rnd()-.5)*P.rx;d.y=P.y-P.ry;}
+    d.jumpFrom={x:d.x,y:d.y};d.jt=fromWin?0:1;dancers.push(d);}
+  headsIn=[];
+}
+function formationName(){
+  if(!isNight(S.sun)){const Lf=shadowLen();return Lf<0.6?'ring':Lf<1.2?'cross':'line';}
+  const c=S.lit.filter(v=>v).length;return c===0?'ring':c===1?'line':c===2?'cross':'ring';
+}
+function setFormation(instant){
+  if(!S.res)return;
+  if(dancers.length<dancerCount())makeDancers(false);
+  const f=formationName();
+  const v=((S.swapAt===T_DUSK?0:1)+S.swaps)%2;  // 交換の順で形が変わる
+  const n=dancers.length;
+  const sh=shears(P.x)[0]||[0.6,0.4];
+  const pos=[];
+  if(f==='ring'){
+    for(let i=0;i<n;i++){const dbl=v===1&&i%2===1;const a=-PI/2+i/n*TAU+(v?0.3:0);
+      const r=dbl?0.74:1.0;pos.push([P.x+Math.cos(a)*P.rx*r*0.95,P.y+Math.sin(a)*P.ry*r*0.85+P.ry*0.12]);}
+  }else if(f==='line'){
+    const span=Math.min(P.rx*2.1,Math.max(Math.abs(sh[0])*110*(n-1),P.rx*1.5));
+    const yy=v?P.y+P.ry*0.95:P.y-P.ry*0.62;
+    const dir=sh[0]>=0?1:-1;const gap=(D*0.62/k)/(span/2);
+    for(let i=0;i<n;i++){let u=n>1?i/(n-1)*2-1:0;u=Math.sign(u||1)*(gap+Math.abs(u)*(1-gap));pos.push([P.x+dir*u*span/2,yy+(v?-1:1)*u*P.ry*0.08]);}
+  }else{
+    const ang=(v?0:PI/4)+clamp(sh[0],-1,1)*0.25;
+    const ax=[[Math.cos(ang),Math.sin(ang)],[Math.cos(ang+PI/2),Math.sin(ang+PI/2)]];
+    const Rw=D*0.62/k;
+    for(let i=0;i<n;i++){const dir=i%4;const a=ax[dir%2],side=dir<2?1:-1;const dist=Rw*(i<4?1.25:2.0);
+      pos.push([P.x+a[0]*dist*side*1.25,P.y+P.ry*0.05+a[1]*dist*side*0.8]);}
+  }
+  for(let i=0;i<n;i++){const d=dancers[i];d.tx=pos[i][0];d.ty=pos[i][1];if(instant&&d.jt>=1){d.x=d.tx;d.y=d.ty;}}
+  if(f!==curForm||!instant){log('form',{f,v,n,tile:S.sun});}
+  curForm=f;
+}
+function* stompDance(){
+  if(!S.res)return;
+  for(let i=0;i<dancers.length;i++){dancers[i].stomp=1;if(i%2===0)sfx.step();yield 0.09;}
+  yield 0.15;
+}
+
+/* ================= 入力 ================= */
+function toW(x,y){return{x:(x-ox)/k,y:(y-y0)/k};}
+function hitDice(x,y){const dx=x-dX,dy=y-(dY);return dx*dx+dy*dy<=(D*0.78)*(D*0.78);}
+const OBJ=[['oven',15,135,-125,0],['bakery',112,313,-275,0],['shelf',305,450,-118,0],['h1',492,668,-240,0],['h2',725,925,-320,0],
+  ['lamp0',LX[0]-18,LX[0]+40,-255,0],['lamp1',LX[1]-18,LX[1]+40,-255,0],['lamp2',LX[2]-18,LX[2]+40,-255,0]];
+function hitOther(x,y){
+  const w=toW(x,y);
+  for(const p of[small,tall]){const h=p.kind==='small'?160:250;if(w.x>p.x-35&&w.x<p.x+35&&w.y>p.y-h-p.climb&&w.y<p.y+8){p.wob=1;return true;}}
+  for(const d of dancers){if(Math.abs(w.x-d.x)<35&&w.y>d.y-170*d.scale&&w.y<d.y+8){d.stomp=1;return true;}}
+  for(const o of OBJ){if(w.x>o[1]&&w.x<o[2]&&w.y>o[3]&&w.y<o[4]+6){wob[o[0]]=1;return true;}}
+  return false;
+}
+function onDown(e){
+  e.preventDefault();
+  initAudio();
+  lastInput=performance.now();hintDone=false;
+  if(hint){hint=null;dice.demo=0;}
+  const x=e.clientX,y=e.clientY;
+  if(hitDice(x,y)){
+    if(pressId===null){pressId=e.pointerId;dice.pressed=true;dice.sy=0.74;dice.vy=0;sfx.press();log('press');}
+  }else if(hitOther(x,y)){sfx.tick();}
+}
+function onUp(e){
+  e.preventDefault();lastInput=performance.now();
+  if(e.pointerId!==pressId)return;
+  pressId=null;dice.pressed=false;dice.vy=6;
+  if(busy){queued=true;}else startTurn();
+}
+function onCancel(e){if(e.pointerId===pressId){pressId=null;dice.pressed=false;dice.vy=3;}}
+cv.addEventListener('pointerdown',onDown,{passive:false});
+cv.addEventListener('pointerup',onUp,{passive:false});
+cv.addEventListener('pointercancel',onCancel);
+cv.addEventListener('lostpointercapture',onCancel);
+['touchstart','touchmove','touchend','gesturestart','gesturechange','dblclick'].forEach(ev=>document.addEventListener(ev,e=>{if(e.cancelable)e.preventDefault();},{passive:false}));
+document.addEventListener('contextmenu',e=>e.preventDefault());
+window.addEventListener('resize',layout);
+window.addEventListener('orientationchange',()=>setTimeout(layout,120));
+
+/* ================= 更新 ================= */
+function updPerson(p,dt){
+  const dx=p.tx-p.x;
+  if(Math.abs(dx)>1){const st=Math.min(Math.abs(dx),p.speed*dt);p.x+=Math.sign(dx)*st;p.face=Math.sign(dx);p.phase+=dt*(p.kind==='small'?16:11);p.moving=true;}
+  else{p.x=p.tx;p.moving=false;}
+  if(!p.moving){if(p.faceLock)p.face=p.faceLock;else p.face=(P.x-p.x)>=0?1:-1;}
+  p.climb+= (p.climbT-p.climb)*Math.min(1,dt*14);
+  if(p.hatT>0){p.hatT=Math.max(0,p.hatT-dt);}
+  p.hatLift=p.hatT>0?Math.sin((1-p.hatT/0.7)*PI):0;
+  p.wob=Math.max(0,p.wob-dt*2.5);
+  p.hop=p.moving&&p.kind==='small'?Math.abs(Math.sin(p.phase))*7:0;
+  // 手の目標
+  const sm=p.kind==='small';
+  const sh=sm?[8,-86]:[6,-182],AL=sm?40:82;
+  let tx,ty;
+  const a=p.arm;
+  if(p.hatLift>0.05){tx=sh[0]+4;ty=(sm?-140:-232)-p.hatLift*14;}
+  else if(a==='carry'){tx=sh[0]+(sm?24:30);ty=sm?-72:-150;}
+  else if(a==='give'){tx=sh[0]+(sm?34:66);ty=sm?-86:-170;}
+  else if(a==='reach'){tx=sh[0]+(sm?20:40);ty=sh[1]-AL*0.95;}
+  else if(a==='peel'){tx=sh[0]+(sm?32:60);ty=sh[1]+(sm?14:40)+Math.sin(clock*14)*4;}
+  else if(a==='fling'){tx=sh[0]+(sm?26:40);ty=sh[1]-AL*0.8;}
+  else if(p.moving){const s=Math.sin(p.phase)*0.7;tx=sh[0]+Math.sin(s)*AL*0.6;ty=sh[1]+Math.cos(s)*AL*0.9;}
+  else{ // 待機の仕草
+    if(p===B()){tx=sh[0]+(sm?22:40);ty=sh[1]+(sm?18:50)+Math.sin(clock*5)*5;}  // こねる
+    else{const lift=(Math.sin(clock*1.6)>0.6)?1:0;tx=sh[0]+(sm?12:22);ty=lift?sh[1]-AL*0.7:sh[1]+AL*0.85;} // 見上げて確かめる
+    if(p.hold){tx=sh[0]+(sm?24:30);ty=sm?-72:-150;}
+  }
+  const d=Math.hypot(tx-sh[0],ty-sh[1]);if(d>AL){tx=sh[0]+(tx-sh[0])*AL/d;ty=sh[1]+(ty-sh[1])*AL/d;}
+  const r=Math.min(1,dt*16);p.hx+=(tx-p.hx)*r;p.hy+=(ty-p.hy)*r;
+  p.hwx=p.x+p.face*p.hx;p.hwy=p.y-p.climb-p.hop+p.hy;
+}
+function updDancer(d,dt){
+  if(d.jt<1){d.jt=Math.min(1,d.jt+dt*1.6);const u=ease(d.jt);
+    d.x=lerp(d.jumpFrom.x,d.tx,u);d.y=lerp(d.jumpFrom.y,d.ty,u)-Math.sin(u*PI)*160;d.face=d.tx>d.jumpFrom.x?1:-1;
+    if(d.jt>=1){sfx.step();crumbs(d.x,d.y,2);}return;}
+  const dx=d.tx-d.x,dy=d.ty-d.y,dist=Math.hypot(dx,dy);
+  if(dist>2){const st=Math.min(dist,300*dt);d.x+=dx/dist*st;d.y+=dy/dist*st;d.phase+=dt*13;d.hop=Math.abs(Math.sin(d.phase))*12;if(Math.abs(dx)>2)d.face=Math.sign(dx);}
+  else{d.hop=Math.abs(Math.sin(clock*4+d.type))*4;d.face=(P.x-d.x)>=0?1:-1;}
+  if(d.stomp>0){d.stomp=Math.max(0,d.stomp-dt*3.2);d.hop+=Math.sin((1-d.stomp)*PI)*30;}
+}
+function update(dt){
+  clock+=dt;
+  updTasks(dt);
+  // 太陽
+  if(sunA.t<1){sunA.t=Math.min(1,sunA.t+dt/sunA.dur);}
+  sunA.sq=Math.max(0,sunA.sq-dt*4);
+  // 影の伸縮
+  const st=sunTarget(S.sun);const day=!isNight(S.sun);
+  const r=Math.min(1,dt*7);
+  if(day){sunSh.shx+=(st.shx-sunSh.shx)*r;sunSh.shy+=(st.shy-sunSh.shy)*r;}
+  sunSh.s+=((day?1:0)-sunSh.s)*r;
+  for(let i=0;i<3;i++){lampS[i]+=((S.lit[i]?1:0)-lampS[i])*Math.min(1,dt*5);lampFlash[i]=Math.max(0,lampFlash[i]-dt*2);}
+  // さいころ
+  const target=dice.pressed?0.74:(dice.demo>0?0.84:1);
+  if(dice.pressed){dice.sy+=(0.74-dice.sy)*Math.min(1,dt*30);dice.vy=0;}
+  else{dice.vy+=(-(dice.sy-target)*260-dice.vy*13)*dt;dice.sy+=dice.vy*dt;}
+  dice.sx=1+(1-dice.sy)*0.6;
+  if(dice.rollT>0){dice.rollT=Math.max(0,dice.rollT-dt);const u=1-dice.rollT/0.5;dice.hop=Math.sin(u*PI)*D*0.55;dice.rot=u*TAU*0.75;
+    if(Math.floor(u*8)!==dice._s){dice._s=Math.floor(u*8);dice.sym=(dice.sym+1)%4;}
+    if(dice.rollT===0){dice.rot=0;dice.hop=0;dice.sy=0.82;dice.vy=-1;sfx.wood(0.7,0.4);}}
+  else if(!busy&&!dice.pressed){
+    dice.idleT+=dt;const ph=dice.idleT%1.7;
+    dice.hop=ph<0.32?Math.sin(ph/0.32*PI)*D*0.09:0;
+    if(ph>=0.32&&ph-dt<0.32){dice.sy=0.92;dice.vy=-0.5;}
+  }else{dice.idleT=0;if(dice.rollT<=0)dice.hop=0;}
+  // 人物
+  updPerson(small,dt);updPerson(tall,dt);
+  for(const d of dancers)updDancer(d,dt);
+  // 飛ぶもの
+  for(let i=flyers.length-1;i>=0;i--){const f=flyers[i];f.t+=dt/f.dur;
+    if(f.target){f.x1=f.target.hwx;f.y1=f.target.hwy;}
+    if(f.t>=1){f.t=1;f.done=true;flyers.splice(i,1);}}
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];if(p.d>0){p.d-=dt;continue;}p.life-=dt;
+    if(p.kind===0){p.vy+=500*dt;}p.x+=p.vx*dt;p.y+=p.vy*dt;if(p.kind===0&&p.y>p.fl){p.y=p.fl;p.vy*=-0.3;p.vx*=0.6;}
+    if(p.life<=0)parts.splice(i,1);}
+  for(const pj of projs)pj.t=Math.min(1,pj.t+dt*1.6);
+  for(let i=0;i<8;i++)breadPop[i]=Math.max(0,breadPop[i]-dt*3);
+  winFlash=Math.max(0,winFlash-dt*1.5);signPop=Math.max(0,signPop-dt*2.5);
+  for(const key in wob)wob[key]=Math.max(0,wob[key]-dt*2.5);
+  // お手本の手
+  const now=performance.now();
+  if(!busy&&pressId===null&&!hint&&!hintDone&&now-lastInput>4000){hint={t:0};hintDone=true;log('hint');}
+  if(hint){hint.t+=dt;const t=hint.t;dice.demo=(t>0.55&&t<0.85)?1:0;if(t>1.5){hint=null;dice.demo=0;}}
+}
+
+/* ================= 描画ヘルパ ================= */
+let PASS=1,LIGHT='#fff';
+function F(rule){if(PASS===0){ctx.lineJoin='round';ctx.lineWidth=HALO;ctx.strokeStyle=LIGHT;ctx.stroke();ctx.fillStyle=LIGHT;ctx.fill(rule||'nonzero');}
+  else{ctx.fillStyle='#000';ctx.fill(rule||'nonzero');}}
+function Ln(x1,y1,x2,y2,w){ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.lineCap='round';
+  ctx.lineWidth=PASS===0?w+HALO:w;ctx.strokeStyle=PASS===0?LIGHT:'#000';ctx.stroke();}
+function Ci(x,y,r){ctx.beginPath();ctx.arc(x,y,Math.max(0.1,r),0,TAU);F();}
+function El(x,y,a,b,rot){ctx.beginPath();ctx.ellipse(x,y,Math.max(0.1,a),Math.max(0.1,b),rot||0,0,TAU);F();}
+function Po(pts){ctx.beginPath();ctx.moveTo(pts[0],pts[1]);for(let i=2;i<pts.length;i+=2)ctx.lineTo(pts[i],pts[i+1]);ctx.closePath();F();}
+function rrect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+/* パンの形（中心0,0、半幅s） */
+function breadPath(type,s){
+  ctx.beginPath();
+  switch(type){
+    case 0: ctx.moveTo(-s,0.4*s);ctx.bezierCurveTo(-s*1.05,-0.95*s,s*1.05,-0.95*s,s,0.4*s);ctx.closePath();return'nonzero';
+    case 1: ctx.ellipse(0,0,1.45*s,0.42*s,-0.18,0,TAU);
+      return'nonzero';
+    case 2: ctx.arc(0,0.45*s,1.05*s,PI*1.02,PI*1.98);ctx.quadraticCurveTo(0.6*s,0.05*s,0,-0.05*s);ctx.quadraticCurveTo(-0.6*s,0.05*s,-1.03*s,0.45*s);ctx.closePath();return'nonzero';
+    case 3: ctx.ellipse(0,0,1.1*s,0.86*s,0,0,TAU);ctx.moveTo(-0.12*s,-0.1*s);ctx.ellipse(-0.43*s,-0.1*s,0.3*s,0.33*s,0,0,TAU);
+      ctx.moveTo(0.73*s,-0.1*s);ctx.ellipse(0.43*s,-0.1*s,0.3*s,0.33*s,0,0,TAU);
+      ctx.moveTo(0.18*s,0.86*s);ctx.lineTo(0,0.42*s);ctx.lineTo(-0.18*s,0.86*s);ctx.closePath();return'evenodd';
+    case 4: ctx.arc(-0.78*s,0.1*s,0.5*s,0,TAU);ctx.moveTo(0.62*s,-0.05*s);ctx.arc(0,-0.05*s,0.62*s,0,TAU);ctx.moveTo(1.28*s,0.1*s);ctx.arc(0.78*s,0.1*s,0.5*s,0,TAU);return'nonzero';
+    default:{for(let i=0;i<10;i++){const a=-PI/2+i*PI/5,r=i%2?0.5*s:1.08*s;i?ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r):ctx.moveTo(Math.cos(a)*r,Math.sin(a)*r);}ctx.closePath();return'nonzero';}
+  }
+}
+function drawBread(type,x,y,s,rot,sy){ctx.save();ctx.translate(x,y);if(rot)ctx.rotate(rot);if(sy)ctx.scale(1,sy);const r=breadPath(type,s);F(r);ctx.restore();}
+
+/* 帽子（頭頂0,0） */
+function drawHat(type){
+  if(type==='toque'){ctx.beginPath();ctx.rect(-14,-9,30,10);ctx.moveTo(-6,-14);ctx.arc(-6,-16,10,0,TAU);ctx.moveTo(15,-20);ctx.arc(5,-21,11,0,TAU);
+    ctx.moveTo(22,-14);ctx.arc(14,-14,8,0,TAU);F();}
+  else{ctx.beginPath();ctx.rect(-19,-5,40,6);ctx.rect(-11,-36,24,32);F();}
+}
+/* 道具（背中または手） */
+function drawTool(tool,sm,inHand){
+  if(tool==='peel'){
+    if(inHand){Ln(0,0,sm?74:96,6,4);El(sm?84:108,7,15,5,0.05);}
+    else{const t=sm?150:236;Ln(-14,-40,-26,-t+18,4);El(-28,-t,9,15,-0.12);}
+  }else{
+    const t=sm?150:236,b=sm?-14:-30;
+    Ln(-14,b,-22,-t,4);Ln(-30,b,-38,-t,4);
+    for(let y=b-18;y>-t+8;y-=24){const u=(y-b)/(-t-b);Ln(-14-8*u,y,-30-8*u,y,3);}
+  }
+}
+function drawLantern(lit){ctx.beginPath();ctx.rect(-7,0,14,16);ctx.moveTo(-9,0);ctx.lineTo(9,0);ctx.lineTo(0,-6);ctx.closePath();F();
+  if(PASS===1&&lit){ctx.fillStyle=LIGHT;ctx.beginPath();ctx.ellipse(0,8,3.5,5,0,0,TAU);ctx.fill();}}
+function drawFlame(x,y,s){ctx.save();ctx.translate(x,y);
+  ctx.beginPath();ctx.moveTo(0,-s*1.6);ctx.quadraticCurveTo(s*1.1,-s*0.2,0,s);ctx.quadraticCurveTo(-s*1.1,-s*0.2,0,-s*1.6);ctx.closePath();
+  ctx.lineWidth=HALO*0.7;ctx.strokeStyle='#000';ctx.stroke();ctx.fillStyle=LIGHT;ctx.fill();ctx.restore();}
+
+/* ---- 人物 ---- */
+function drawPerson(p){
+  const sm=p.kind==='small';
+  ctx.save();
+  ctx.translate(p.x,p.y-p.climb-p.hop);
+  if(p.wob>0)ctx.rotate(Math.sin(p.wob*25)*0.06*p.wob);
+  ctx.scale(p.face,1);
+  const ph=p.moving?p.phase:0;
+  const hipY=sm?-36:-98,LL=sm?36:98,lw=sm?11:9;
+  const a1=p.moving?Math.sin(ph)*0.55:0;
+  const tool=toolOf(p);
+  // 背中の道具
+  if(!p.toolHide&&!p.toolHand)drawTool(tool,sm,false);
+  // 奥の腕
+  const sh=sm?[8,-86]:[6,-182];
+  Ln(sh[0]-4,sh[1],sh[0]-4+(p.hx-sh[0])*0.6-6,sh[1]+(p.hy-sh[1])*0.9,sm?8:7);
+  // 脚
+  Ln(-5,hipY,-5+Math.sin(a1)*LL,hipY+Math.cos(a1)*LL,lw);
+  Ln(5,hipY,5+Math.sin(-a1)*LL,hipY+Math.cos(a1)*LL,lw);
+  if(sm){El(2,-66,29,33);Ci(6,-114,19);Po([20,-125,35,-111,20,-106]);ctx.beginPath();ctx.rect(0,-99,12,8);F();}
+  else{Po([-14,-190,16,-190,24,-92,-22,-92]);ctx.beginPath();ctx.rect(1,-193,9,10);F();Ci(5,-206,17);Po([18,-216,38,-203,18,-197]);}
+  // 帽子
+  if(!p.hatHide){ctx.save();const top=sm?-132:-222;ctx.translate(sm?6:5,top-p.hatLift*16);ctx.rotate(-p.hatLift*0.25);drawHat(hatOf(p));ctx.restore();}
+  // 手前の腕
+  Ln(sh[0],sh[1],p.hx,p.hy,sm?9:8);
+  // 手の道具・持ち物
+  if(p.toolHand&&!p.toolHide){ctx.save();ctx.translate(p.hx,p.hy);drawTool(tool,sm,true);ctx.restore();}
+  if(p===Lr()&&S.carry&&!p.toolHide&&!p.hold){ctx.save();ctx.translate(p.hx,p.hy+2);drawLantern(true);ctx.restore();}
+  if(p.hold){ctx.save();ctx.translate(p.hx+6,p.hy-10);
+    if(p.hold.k==='bread'){const r=breadPath(p.hold.shape,13);F(r);}
+    ctx.restore();}
+  ctx.restore();
+  if(p.hold&&p.hold.k==='flame'&&PASS===1){drawFlame(p.hwx+p.face*6,p.hwy-10,7);}
+}
+/* ---- 住人 ---- */
+function drawDancer(d){
+  ctx.save();ctx.translate(d.x,d.y-d.hop);ctx.scale(d.face*d.scale,d.scale);
+  const ph=d.phase,a1=Math.sin(ph)*0.5;
+  const t=d.type;
+  Ln(-5,-50,-5+Math.sin(a1)*50,-50+Math.cos(a1)*50,9);Ln(5,-50,5-Math.sin(a1)*50,-50+Math.cos(a1)*50,9);
+  if(t===2||t===5){Po([-26,-48,26,-48,12,-118,-10,-118]);}else{ctx.beginPath();rrect(-17,-122,34,76,12);F();}
+  Ci(4,-140,17);Po([18,-147,29,-138,18,-133]);ctx.beginPath();ctx.rect(-1,-126,10,8);F();
+  // 髪・帽子で個性（顔の前は隠さない）
+  if(t===0){Ci(-14,-142,9);}            // 結び髪
+  else if(t===1){ctx.beginPath();ctx.rect(-14,-162,28,8);ctx.rect(-14,-162,40,4);F();Ln(26,-60,34,0,4);} // 帽子と杖
+  else if(t===2){Ci(-6,-160,10);}       // おだんご
+  else if(t===3){ctx.beginPath();ctx.ellipse(2,-155,17,8,0,PI,TAU);ctx.rect(2,-156,24,4);F();}
+  else if(t===4){El(0,-158,20,6,0.1);}  // ベレー
+  else if(t===5){Ln(-12,-150,-28,-128,7);}
+  const sw=Math.sin(clock*6+t)*0.6;
+  Ln(6,-110,6+Math.sin(sw+2.4)*44,-110+Math.cos(sw+2.4)*44,7);
+  Ln(-2,-110,-2+Math.sin(-sw+3.6)*44,-110+Math.cos(-sw+3.6)*44,7);
+  ctx.restore();
+}
+
+/* ---- 建物 ---- */
+function pathOven(){ctx.beginPath();ctx.moveTo(15,0);ctx.lineTo(15,-42);ctx.bezierCurveTo(15,-122,135,-122,135,-42);ctx.lineTo(135,0);ctx.closePath();ctx.rect(92,-124,16,34);}
+function pathBakery(){ctx.beginPath();ctx.rect(125,-190,175,190);ctx.moveTo(110,-188);ctx.lineTo(212,-268);ctx.lineTo(315,-188);ctx.closePath();ctx.rect(255,-262,22,52);}
+function pathShelf(){ctx.beginPath();ctx.rect(305,-112,145,7);ctx.rect(305,-60,145,7);ctx.rect(309,-112,6,112);ctx.rect(440,-112,6,112);}
+function pathH1(){ctx.beginPath();ctx.rect(505,-160,150,160);ctx.moveTo(490,-158);ctx.lineTo(580,-240);ctx.lineTo(670,-158);ctx.closePath();ctx.rect(620,-228,16,46);}
+function pathH2(){ctx.beginPath();ctx.rect(725,-206,200,206);ctx.rect(760,-266,70,62);ctx.moveTo(750,-264);ctx.lineTo(795,-322);ctx.lineTo(840,-264);ctx.closePath();
+  ctx.moveTo(830,-206);ctx.lineTo(930,-206);ctx.lineTo(905,-232);ctx.lineTo(855,-232);ctx.closePath();}
+function pathLamp(i){const x=LX[i];ctx.beginPath();ctx.rect(x-4,-205,8,205);ctx.rect(x-10,-14,20,14);
+  ctx.moveTo(x-15,-205);ctx.lineTo(x+15,-205);ctx.lineTo(x+11,-240);ctx.lineTo(x-11,-240);ctx.closePath();
+  ctx.moveTo(x-14,-240);ctx.lineTo(x,-254);ctx.lineTo(x+14,-240);ctx.closePath();ctx.rect(x,-193,28,4);ctx.rect(x+25,-193,3,12);}
+const CASTERS=[{f:pathOven,x:75,id:'oven'},{f:pathBakery,x:212,id:'bakery'},{f:pathShelf,x:377,id:'shelf'},{f:pathH1,x:580,id:'h1'},{f:pathH2,x:825,id:'h2'},
+  {f:()=>pathLamp(0),x:LX[0],id:'lamp0'},{f:()=>pathLamp(1),x:LX[1],id:'lamp1'},{f:()=>pathLamp(2),x:LX[2],id:'lamp2'}];
+function wobT(id,x){const w=wob[id];if(w>0){ctx.translate(x,0);ctx.rotate(Math.sin(w*28)*0.025*w);ctx.translate(-x,0);}}
+function shearAt(ax,ay,s){ctx.translate(ax,ay);ctx.transform(1,0,-s[0],-s[1],0,0);ctx.translate(-ax,-ay);}
+
+function drawShadows(){
+  ctx.fillStyle='#000';PASS=2;
+  for(const c of CASTERS){const list=shears(c.x);for(const s of list){ctx.save();shearAt(c.x,0,s);c.f();ctx.fill();ctx.restore();}}
+  for(const p of[small,tall]){const list=shears(p.x);for(const s of list){ctx.save();
+    shearAt(p.x,p.y,s);drawPerson(p);ctx.restore();}}
+  for(const d of dancers){if(d.jt<1)continue;const list=shears(d.x);for(const s of list){ctx.save();shearAt(d.x,d.y,s);drawDancer(d);ctx.restore();}}
+  PASS=1;
+}
+
+function drawBuildings(){
+  const L=LIGHT;
+  // 街灯の光の輪（建物の後ろ）
+  for(let i=0;i<3;i++){const s=lampS[i];if(s<0.02)continue;ctx.fillStyle=L;ctx.beginPath();
+    ctx.arc(LX[i]+8,-210,(64+lampFlash[i]*18)*s,0,TAU);ctx.fill();}
+  ctx.fillStyle='#000';
+  // 窯
+  ctx.save();wobT('oven',75);pathOven();ctx.fill();
+  if(ovenGlow>0||S.bLight){ctx.fillStyle=L;ctx.beginPath();const g=ovenGlow>0?1:0.45;
+    ctx.moveTo(50,0);ctx.lineTo(50,-20*g);ctx.arc(75,-20*g,25*g+0.1,PI,0);ctx.lineTo(100,0);ctx.closePath();
+    if(ovenGlow>0){ctx.rect(68,-80,14,10);}
+    ctx.fill();}
+  ctx.restore();
+  // パン屋
+  ctx.save();wobT('bakery',212);ctx.fillStyle='#000';pathBakery();ctx.fill();
+  if(S.bLight){ctx.fillStyle=L;const e=winFlash*6;ctx.fillRect(160-e,-150-e,70+e*2,58+e*2);ctx.fillStyle='#000';ctx.fillRect(192,-150,6,58);ctx.fillRect(160,-124,70,5);}
+  // 看板：次に焼けるパンの形
+  ctx.fillStyle='#000';ctx.fillRect(300,-178,34,5);ctx.fillRect(330,-178,3,12);
+  ctx.save();ctx.translate(331,-152);const sp=1+signPop*0.5;ctx.scale(sp,sp);PASS=1;const r=breadPath(S.shapes[S.si],13);ctx.fillStyle='#000';ctx.fill(r);ctx.restore();
+  ctx.restore();
+  // 棚とパン
+  ctx.save();wobT('shelf',377);ctx.fillStyle='#000';pathShelf();ctx.fill();
+  PASS=1;
+  for(let i=0;i<S.shelf.length;i++){const p=slotPos(i);const s=15*(1+breadPop[i]*0.4);drawBread(S.shelf[i],p.x,p.y,s,0);}
+  if(slotHint){const p=slotPos(slotHint.idx);ctx.save();ctx.translate(p.x,p.y);const r=breadPath(slotHint.shape,15);ctx.lineWidth=2.5/k;ctx.strokeStyle=L;ctx.setLineDash([4/k,3/k]);ctx.stroke();ctx.restore();ctx.setLineDash([]);}
+  ctx.restore();
+  // 家
+  const night=isNight(S.sun);
+  ctx.save();wobT('h1',580);ctx.fillStyle='#000';pathH1();ctx.fill();ctx.restore();
+  ctx.save();wobT('h2',825);ctx.fillStyle='#000';pathH2();ctx.fill();ctx.restore();
+  for(let wi=0;wi<WINDOWS.length;wi++){const w=WINDOWS[wi];const on=night||headsIn.includes(wi);if(!on)continue;
+    ctx.fillStyle=L;ctx.fillRect(w[0],w[1],w[2],w[3]);
+    if(headsIn.includes(wi)){ctx.fillStyle='#000';const hx=w[0]+w[2]/2,hy=w[1]+w[3];ctx.beginPath();ctx.arc(hx,hy-12,9,0,TAU);ctx.fill();
+      ctx.beginPath();ctx.moveTo(hx+8,hy-16);ctx.lineTo(hx+14,hy-11);ctx.lineTo(hx+8,hy-8);ctx.fill();ctx.fillRect(hx-10,hy-4,20,4);}
+    else{ctx.fillStyle='#000';ctx.fillRect(w[0]+w[2]/2-1.5,w[1],3,w[3]);}}
+  // 街灯
+  for(let i=0;i<3;i++){ctx.save();wobT('lamp'+i,LX[i]);ctx.fillStyle='#000';pathLamp(i);ctx.fill();
+    if(S.lit[i]||lampS[i]>0.5){ctx.fillStyle=L;ctx.beginPath();ctx.moveTo(LX[i]-9,-209);ctx.lineTo(LX[i]+9,-209);ctx.lineTo(LX[i]+7,-235);ctx.lineTo(LX[i]-7,-235);ctx.closePath();ctx.fill();}
+    if(S.orn[i]>=0){ctx.fillStyle='#000';PASS=1;drawBread(S.orn[i],LX[i]+27,-170,11,Math.sin(clock*2+i)*0.15);}
+    ctx.restore();}
+}
+function drawLadder(){if(!ladder.on)return;const x=LX.indexOf?ladder.x:0;
+  PASS=0;Ln(x-34,STREET,x-8,-196,4);Ln(x-20,STREET,x+4,-196,4);PASS=1;
+  Ln(x-34,STREET,x-8,-196,4);Ln(x-20,STREET,x+4,-196,4);
+  for(let i=1;i<10;i++){const u=i/10;Ln(lerp(x-34,x-8,u),lerp(STREET,-196,u),lerp(x-20,x+4,u),lerp(STREET,-196,u),3);}}
+
+function drawPlaza(){
+  // 積み重なる影模様（石畳に残る形）
+  ctx.fillStyle='#000';PASS=1;
+  for(let i=0;i<S.plaza.length;i++){const side=i%2?1:-1,j=Math.floor(i/2);const a=side>0?(-PI*0.12+j*PI*0.1):(PI*1.12-j*PI*0.1);
+    const x=P.x+Math.cos(a)*P.rx*1.22,y=P.y+Math.sin(a)*P.ry*0.9;
+    ctx.save();ctx.translate(x,y);ctx.scale(1,0.6);const r=breadPath(S.plaza[i],Math.min(P.rx,P.ry)*0.12);ctx.fill(r);ctx.restore();}
+  // 飾りの影の投影
+  if(S.proj&&isNight(S.sun)){
+    for(let i=0;i<3;i++){if(S.orn[i]<0||!S.lit[i])continue;const pj=projs.find(q=>q.i===i);const t=pj?ease(pj.t):1;
+      const to=projPos(i);const x=lerp(LX[i]+27,to.x,t),y=lerp(-170,to.y,t);const s=lerp(11,Math.min(P.rx,P.ry)*0.4,t);
+      ctx.save();ctx.translate(x,y);ctx.transform(1,0,(LX[i]-P.x)/900*t,0.62,0,0);const r=breadPath(S.orn[i],s);ctx.fillStyle='#000';ctx.fill(r);ctx.restore();}
+  }
+}
+function drawFlyers(){
+  for(const f of flyers){const u=ease(f.t);const x=lerp(f.x0,f.x1,u),y=lerp(f.y0,f.y1,u)-Math.sin(u*PI)*f.arc;
+    if(f.kind==='bshadow'){ctx.save();ctx.translate(x,y);ctx.rotate(f.spin*u);ctx.scale(1,0.55+0.45*u);ctx.fillStyle='#000';const r=breadPath(f.shape,lerp(f.s0,f.s1,u));
+      ctx.lineWidth=HALO*0.6;ctx.strokeStyle=LIGHT;ctx.stroke();ctx.fill(r);ctx.restore();}
+    else if(f.kind==='bread'){PASS=0;drawBread(f.shape,x,y,13,u*PI);PASS=1;drawBread(f.shape,x,y,13,u*PI);}
+    else if(f.kind==='flame'){drawFlame(x,y,8);}
+    else if(f.kind==='hat'){for(PASS=0;PASS<2;PASS++){ctx.save();ctx.translate(x,y);ctx.rotate(f.spin*u);drawHat(f.hat);ctx.restore();}PASS=1;}
+    else if(f.kind==='tool'){for(PASS=0;PASS<2;PASS++){ctx.save();ctx.translate(x+20,y+60);ctx.rotate(f.spin*u);ctx.translate(0,-60);drawTool(f.tool,true,false);ctx.restore();}PASS=1;}
+  }
+  ctx.fillStyle='#000';
+  for(const p of parts){if(p.d>0)continue;if(p.kind===0){ctx.fillRect(p.x-p.s/2,p.y-p.s/2,p.s,p.s);}
+    else{const a=1-p.life/1.6;ctx.beginPath();ctx.arc(p.x,p.y,p.s*(0.6+a),0,TAU);ctx.fill();}}
+}
+
+/* ---- 輪・マス・太陽・さいころ（画面座標） ---- */
+function ringPos(u){const a=PI+u*TAU/N;return[cx+Math.cos(a)*rx,y0+Math.sin(a)*ry];}
+function tileIcon(i,x,y,r){
+  ctx.fillStyle=LIGHT;ctx.save();ctx.translate(x,y);
+  if(i===T_OVEN){ctx.scale(r/30,r/30);breadPath(S.shapes[S.si],15);ctx.fill();}
+  else if(i===T_LAMP){ctx.fillRect(-2,-r*0.2,4,r*0.75);ctx.beginPath();ctx.moveTo(-r*0.32,-r*0.2);ctx.lineTo(r*0.32,-r*0.2);ctx.lineTo(r*0.22,-r*0.62);ctx.lineTo(-r*0.22,-r*0.62);ctx.fill();}
+  else if(i===T_PROJ){ctx.scale(r/30,r/30*0.7);breadPath(3,16);ctx.fill('evenodd');}
+  else if(i===T_DAWN||i===T_DUSK){ctx.scale(r/26,r/26);ctx.translate(-9,6);drawHatIcon('toque');ctx.translate(20,0);drawHatIcon('top');}
+  else{ctx.beginPath();ctx.arc(0,0,r*0.22,0,TAU);ctx.fill();}
+  ctx.restore();
+}
+function drawHatIcon(t){ctx.save();ctx.scale(0.6,0.6);if(t==='toque'){ctx.beginPath();ctx.rect(-12,-9,26,10);ctx.arc(-5,-16,9,0,TAU);ctx.moveTo(14,-20);ctx.arc(6,-20,9,0,TAU);ctx.fill();}
+  else{ctx.fillRect(-17,-5,36,6);ctx.fillRect(-10,-33,22,29);}ctx.restore();}
+function drawRing(){
+  ctx.strokeStyle='#000';ctx.lineWidth=Math.max(2,tileR*0.16);ctx.beginPath();ctx.ellipse(cx,y0,rx,ry,0,0,TAU);ctx.stroke();
+  for(let i=0;i<N;i++){const[x,y]=ringPos(i);const big=i===T_DAWN||i===T_DUSK||i===T_OVEN||i===T_LAMP||i===T_PROJ;const r=tileR*(big?1:0.72);
+    ctx.fillStyle='#000';ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();tileIcon(i,x,y,r);}
+}
+function drawSun(){
+  let u=sunA.from;let bump=0;
+  if(sunA.t<1){u=sunA.from+ease(sunA.t);bump=Math.sin(sunA.t*PI);}
+  const[x0,yy0]=ringPos(u);const a=PI+u*TAU/N;
+  const out=bump*tileR*1.8;const x=x0+Math.cos(a)*out*0.4,y=yy0-out;
+  const inSky=y<y0;
+  const fill=inSky?CC.gr:CC.sky;
+  const sq=sunA.sq;const R=tileR*1.12;
+  ctx.save();ctx.translate(x,y);ctx.scale(1+sq*0.25,1-sq*0.25);ctx.rotate(clock*0.4);
+  ctx.fillStyle='#000';ctx.beginPath();
+  for(let i=0;i<16;i++){const ang=i*PI/8,rr=i%2?R*1.05:R*1.55;i?ctx.lineTo(Math.cos(ang)*rr,Math.sin(ang)*rr):ctx.moveTo(Math.cos(ang)*rr,Math.sin(ang)*rr);}
+  ctx.closePath();ctx.fill();
+  ctx.fillStyle=fill;ctx.beginPath();ctx.arc(0,0,R*0.82,0,TAU);ctx.fill();
+  ctx.restore();
+}
+function diceSym(i,s){ctx.fillStyle=LIGHT;ctx.beginPath();
+  if(i===0){ctx.arc(0,0,s*0.55,0,TAU);ctx.fill();for(let j=0;j<8;j++){const a=j*PI/4;ctx.beginPath();ctx.arc(Math.cos(a)*s*0.95,Math.sin(a)*s*0.95,s*0.13,0,TAU);ctx.fill();}}
+  else if(i===1){ctx.arc(0,0,s*0.8,0,TAU);ctx.arc(s*0.38,-s*0.2,s*0.68,0,TAU,true);ctx.fill('evenodd');}
+  else if(i===2){breadPath(S.shapes[S.si],s*0.8);ctx.fill('evenodd');}
+  else{ctx.fillRect(-s*0.08,-s*0.2,s*0.16,s);ctx.moveTo(-s*0.4,-s*0.2);ctx.lineTo(s*0.4,-s*0.2);ctx.lineTo(s*0.28,-s*0.75);ctx.lineTo(-s*0.28,-s*0.75);ctx.fill();}
+}
+function drawDice(){
+  const x=dX,y=dY-dice.hop;
+  // 地面の影
+  ctx.fillStyle='#000';ctx.beginPath();const sw=1-Math.min(1,dice.hop/(D*0.8))*0.5;ctx.ellipse(dX,dY+D*0.5,D*0.55*sw,D*0.1*sw,0,0,TAU);ctx.fill();
+  ctx.save();ctx.translate(x,y+D*0.5);ctx.scale(dice.sx,dice.sy);ctx.translate(0,-D*0.5);ctx.rotate(dice.rot);
+  rrect(-D/2,-D/2,D,D,D*0.2);ctx.lineWidth=7;ctx.strokeStyle=LIGHT;ctx.stroke();ctx.fillStyle='#000';ctx.fill();
+  rrect(-D*0.37,-D*0.37,D*0.74,D*0.74,D*0.13);ctx.lineWidth=Math.max(2,D*0.028);ctx.strokeStyle=LIGHT;ctx.stroke();
+  diceSym(dice.rollT>0?dice.sym:0,D*0.22);
+  ctx.restore();
+}
+function drawHand(){
+  if(!hint)return;const t=hint.t;
+  let px,py;const bx=dX+D*0.1,by=dY-D*0.05;
+  if(t<0.55){const u=ease(t/0.55);px=lerp(dX+D*1.6,bx,u);py=lerp(dY+D*1.4,by-D*0.35,u);}
+  else if(t<0.85){const u=(t-0.55)/0.3;px=bx;py=by-D*0.35+Math.sin(u*PI)*D*0.2;}
+  else{const u=ease((t-0.85)/0.65);px=lerp(bx,dX+D*1.6,u);py=lerp(by-D*0.35,dY+D*1.4,u);}
+  const s=D/110;
+  ctx.save();ctx.translate(px,py);ctx.scale(s,s);ctx.rotate(-0.35);
+  ctx.beginPath();ctx.ellipse(10,40,26,30,0,0,TAU);ctx.rect(-6,-20,14,50);ctx.rect(12,10,12,26);ctx.rect(26,14,12,24);ctx.rect(-26,24,14,30);
+  ctx.lineWidth=7;ctx.strokeStyle='#000';ctx.lineJoin='round';ctx.stroke();ctx.fillStyle=LIGHT;ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  CC=COLnow();LIGHT=CC.light;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle=CC.sky;ctx.fillRect(0,0,W,Math.ceil(y0));
+  ctx.fillStyle=CC.gr;ctx.fillRect(0,Math.floor(y0),W,H-Math.floor(y0)+1);
+  drawRing();
+  ctx.setTransform(dpr*k,0,0,dpr*k,dpr*ox,dpr*y0);
+  drawPlaza();
+  drawShadows();
+  drawBuildings();
+  drawLadder();
+  // 人と住人を奥から順に
+  const ents=[small,tall,...dancers.filter(d=>d.jt<1||d.y<P.y)];
+  ents.sort((a,b)=>a.y-b.y);
+  for(const e of ents){for(PASS=0;PASS<2;PASS++){e.kind?drawPerson(e):drawDancer(e);}}
+  PASS=1;
+  drawFlyers();
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  drawDice();
+  ctx.setTransform(dpr*k,0,0,dpr*k,dpr*ox,dpr*y0);
+  for(const e of dancers.filter(d=>d.jt>=1&&d.y>=P.y).sort((a,b)=>a.y-b.y)){for(PASS=0;PASS<2;PASS++)drawDancer(e);}
+  PASS=1;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  drawSun();
+  drawHand();
+}
+
+/* ================= ループ ================= */
+let last=performance.now(),raf=0,running=true;
+function loop(now){
+  raf=0;if(!running)return;
+  const dt=Math.min(0.05,Math.max(0,(now-last)/1000));last=now;
+  try{update(dt);draw();}catch(e){if(!loop._err){loop._err=1;console.warn(e);}}
+  raf=requestAnimationFrame(loop);
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){running=false;if(raf)cancelAnimationFrame(raf);raf=0;if(AC&&AC.state==='running')AC.suspend().catch(()=>{});log('hidden');}
+  else{running=true;last=performance.now();lastInput=performance.now();if(AC&&AC.state==='suspended')AC.resume().catch(()=>{});if(!raf)raf=requestAnimationFrame(loop);log('visible');}
+});
+// 復元時の配置
+for(let i=0;i<3;i++)lampS[i]=S.lit[i]?1:0;
+{const st=sunTarget(S.sun);sunSh.shx=st.shx;sunSh.shy=st.shy;sunSh.s=isNight(S.sun)?0:1;}
+small.x=small.tx=home(small);tall.x=tall.tx=home(tall);
+layout();
+if(S.res){makeDancers(false);setFormation(true);for(const d of dancers){d.jt=1;d.x=d.tx;d.y=d.ty;}}
+raf=requestAnimationFrame(loop);
+window.__gf={get S(){return S;},log:LOG,get busy(){return busy;},get queued(){return queued;},
+  dice:()=>({x:dX,y:dY,D}),get dancers(){return dancers.length;},get form(){return curForm;},storage:()=>storageOK,get parts(){return parts.length;},get clock(){return clock;},get running(){return running;},
+  layout:()=>({W,H,k,y0,rx,ry,tileR,safe:Object.assign({},safe)})};
+})();
+</script>
+</body>
+</html>
