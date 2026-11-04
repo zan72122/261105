@@ -352,8 +352,8 @@ let cycle=0;
 const D={}; // discovery flags of this cycle
 const R={};
 function resetRobot(){
-  Object.assign(R,{x:-5,z:4,y:0,gy:0,vx:0,vz:0,head:0,r:1.15,rv:1.15,crumbs:0,body:[],chain:[],hasSpool:false,
-    press:0,pressV:0,pressT:0,chest:0,chestV:0,tilt:0,tiltT:0,lean:0,lookX:-2,lookZ:4,lookT:0,lookOX:0,lookOZ:0,
+  Object.assign(R,{x:-1,z:-1.8,y:0,gy:0,vx:0,vz:0,head:0,r:1.15,rv:1.15,crumbs:0,body:[],chain:[],hasSpool:false,
+    press:0,pressV:0,pressT:0,touchT:0,chest:0,chestV:0,tilt:0,tiltT:0,lean:0,lookX:1.5,lookZ:-1.6,lookT:0,lookOX:0,lookOZ:0,
     expr:'calm',exprT:0,blink:0,blinkT:2,ant:0,antV:0,wheel:0,dist:0,jump:0,jumpV:0,strain:0,
     squeeze:0,spillCd:0,bal:0,balT:0,clouds:[],frame:[],loopAcc:0,lastAng:null,trail:[],ribbon:null,fx:0,fy:0,happy:0,hidden:false});
 }
@@ -474,10 +474,10 @@ function buildTable(){
   if(flag){flag=null;}
   // navy cloth runner (decor ground, exit on the left)
   // first crumb: always clear and in front of the robot's gaze
-  R.x=-5;R.z=4;R.head=0;
-  mkItem('crumb',-2.5,4.2,{size:0.4});
+  R.x=-1;R.z=-1.8;R.head=0;
+  mkItem('crumb',1.5,-1.6,{size:0.4});
   // a bead right on the path (pushed while small)
-  mkItem('bead',0.6,3.6,{col:pick(PAL.bead)});
+  mkItem('bead',4.6,-2.2,{col:pick(PAL.bead)});
   // the rest varies per voyage
   for(let i=0;i<8;i++)place('crumb',-12,12,-6.5,11);
   for(let i=0;i<4;i++)place('bead',-11,12,-6,11,{col:pick(PAL.bead)});
@@ -558,7 +558,7 @@ function onDown(e){
   R.lookOX=wxOf(px);R.lookOZ=wzOf(py,R.y+R.rv);R.lookT=1.4;
   if(!ctrlLock&&!R.hidden&&hyp(px-rs[0],py-rs[1])<hitR){
     inp.on=true;
-    R.pressT=1;R.pressV+=6;R.expr='eager';R.exprT=0.6;R.pressLook=0.9;R.pressLX=clamp((px-rs[0])/hitR*2,-1,1);
+    R.pressT=1;R.pressV+=6;R.touchT=1.6;R.expr='eager';R.exprT=1.6;R.pressLook=1.6;R.pressLX=clamp((px-rs[0])/hitR*2,-1,1);
     const fy=R.y+R.rv;inp.offX=wxOf(px)-R.x;inp.offZ=wzOf(py,fy)-R.z;
     SFX.press();LOG('grab');
   }else{
@@ -906,6 +906,7 @@ function updateRobotAnim(dt){
   const k=320,c=18;
   R.pressV+=(-(R.press-(inp.on?0.55+0.45*R.pressT:0))*k-R.pressV*c)*dt;R.press+=R.pressV*dt;
   R.pressT=Math.max(0,R.pressT-dt*3);
+  R.touchT=Math.max(0,R.touchT-dt);
   R.chestV+=(-R.chest*140-R.chestV*7)*dt;R.chest+=R.chestV*dt;
   R.antV+=(-R.ant*90-R.antV*4+(-R.vx*0.6))*dt;R.ant+=R.antV*dt;R.ant=clamp(R.ant,-1.2,1.2);
   R.jumpV-=30*dt;R.jump+=R.jumpV*dt;if(R.jump<0){R.jump=0;if(R.jumpV<-3){R.jumpV=-R.jumpV*0.3;}else R.jumpV=0;}
@@ -1398,6 +1399,14 @@ function drawRobot(){
   ctx.save();
   if(R.bal>0.02)ctx.globalAlpha=1-R.bal/0.6;
   const sink=R.press;
+  // Local touch feedback stays visible while held, then fades after a short tap.
+  if(inp.on||R.touchT>0){
+    const cy=gy-(lift*U+r)*u,glow=r*u*2.3;
+    ctx.globalAlpha*=inp.on?0.9+0.1*Math.sin(clock*5):clamp(R.touchT/0.45,0,1);
+    ctx.fillStyle=RG(ctx,gx,cy,0,gx,cy,glow,[[0,'rgba(255,232,168,0.48)'],[0.55,'rgba(255,220,145,0.32)'],[1,'rgba(255,220,145,0)']]);
+    ell(ctx,gx,cy,glow,glow);ctx.fill();
+    ctx.globalAlpha=R.bal>0.02?1-R.bal/0.6:1;
+  }
   // wheels in world space (show heading)
   const pxp=-Math.sin(R.head),pzp=Math.cos(R.head);
   const wheels=[-1,1].map(sd=>({x:R.x+pxp*sd*r*0.78,z:R.z+pzp*sd*r*0.78*0.9}));
